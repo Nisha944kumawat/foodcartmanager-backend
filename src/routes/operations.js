@@ -50,28 +50,29 @@ r.get('/production', async (req, res) =>
   res.json(await Production.find({ userId: req.user.id }).populate('dishId', 'name').sort({ date: -1 }))
 );
 
-async function buildSale(d, userId, { quantity, returnedQuantity, sellingPrice }) {
-  const q = Number(quantity);
+async function buildSale(d, userId, { platesSold, returnedQuantity }) {
+  const sold = Number(platesSold);
   const returned = Number(returnedQuantity || 0);
-  const price = Number(sellingPrice);
-  if (!(q >= 0) || !(returned >= 0) || !(price >= 0)) throw new Error('Sale values must be 0 or greater');
-  if (returned > q) throw new Error('Returned plates cannot be more than plates sold');
+  if (!(sold >= 0) || !(returned >= 0)) throw new Error('Sale values must be 0 or greater');
 
   const c = await costing(d, userId);
-  const netQuantity = q - returned;
-  const revenue = netQuantity * price;
-  // Making cost covers every plate made. Returned plates are an additional return-loss cost.
-  const cost = q * c.unitCost;
+  const totalMade = sold + returned;
+  const price = Number(d.sellingPrice || 0);
+  // Plates Sell is the number entered as sold. Returns are tracked separately.
+  // Return cost is informational only and is never added/subtracted again from profit.
+  const netSold = Math.max(0, sold - returned);
+  const revenue = netSold * price;
+  const makingCost = sold * c.dishCost;
 
   return {
     dishId: d._id,
-    quantity: q,
+    quantity: totalMade,
     returnedQuantity: returned,
     sellingPrice: price,
-    unitCost: c.unitCost,
+    unitCost: c.dishCost,
     revenue,
-    cost,
-    profit: revenue - cost
+    cost: makingCost,
+    profit: revenue - makingCost
   };
 }
 
@@ -84,21 +85,16 @@ r.post('/sales/bulk', async (req, res) => {
     const saved = [];
 
     for (const row of rows) {
-      const q = Number(row.quantity || 0);
+      const sold = Number(row.platesSold || 0);
       const returned = Number(row.returnedQuantity || 0);
-      if (q === 0 && returned === 0) continue;
+      if (sold === 0 && returned === 0) continue;
 
       const d = await Dish.findOne({ _id: row.dishId, userId: req.user.id, active: true });
       if (!d) throw new Error('Dish not found');
 
-      const price = row.sellingPrice === '' || row.sellingPrice === undefined
-        ? (await costing(d, req.user.id)).recommendedPrice
-        : Number(row.sellingPrice);
-
       const saleData = await buildSale(d, req.user.id, {
-        quantity: q,
-        returnedQuantity: returned,
-        sellingPrice: price
+        platesSold: sold,
+        returnedQuantity: returned
       });
 
       const existing = row._id
@@ -133,14 +129,9 @@ r.post('/sales', async (req, res) => {
   try {
     const d = await Dish.findOne({ _id: req.body.dishId, userId: req.user.id, active: true });
     if (!d) return res.status(404).json({ message: 'Dish not found' });
-    const c = await costing(d, req.user.id);
-    const price = req.body.sellingPrice === undefined || req.body.sellingPrice === ''
-      ? c.recommendedPrice
-      : Number(req.body.sellingPrice);
     const saleData = await buildSale(d, req.user.id, {
-      quantity: Number(req.body.quantity),
-      returnedQuantity: Number(req.body.returnedQuantity || 0),
-      sellingPrice: price
+      platesSold: Number(req.body.platesSold ?? req.body.quantity ?? 0),
+      returnedQuantity: Number(req.body.returnedQuantity || 0)
     });
     res.status(201).json(await Sale.create({
       userId: req.user.id,
@@ -171,21 +162,15 @@ r.put('/sales/:id', async (req, res) => {
     const d = await Dish.findOne({ _id: s.dishId, userId: req.user.id });
     if (!d) return res.status(404).json({ message: 'Dish not found' });
 
-    const c = await costing(d, req.user.id);
-    const q = Number(req.body.quantity ?? s.quantity);
+    const sold = Number(req.body.platesSold ?? Math.max(0, Number(s.quantity || 0) - Number(s.returnedQuantity || 0)));
     const returned = Number(req.body.returnedQuantity ?? s.returnedQuantity ?? 0);
-    const price = Number(req.body.sellingPrice ?? s.sellingPrice);
-    if (returned > q) return res.status(400).json({ message: 'Returned plates cannot be more than plates sold' });
+    if (sold < 0 || returned < 0) return res.status(400).json({ message: 'Sale values must be 0 or greater' });
 
-    const net = q - returned;
-    s.quantity = q;
-    s.returnedQuantity = returned;
-    s.sellingPrice = price;
-    s.unitCost = c.unitCost;
-    s.revenue = net * price;
-    // Making cost covers every plate made; returned plates create an additional loss.
-    s.cost = q * c.unitCost;
-    s.profit = s.revenue - s.cost;
+    const saleData = await buildSale(d, req.user.id, {
+      platesSold: sold,
+      returnedQuantity: returned
+    });
+    Object.assign(s, saleData);
     if (req.body.date) s.date = parseDateInput(req.body.date);
     if (req.body.notes !== undefined) s.notes = req.body.notes;
     await s.save();

@@ -1,8 +1,10 @@
 import { Router } from 'express';
+import mongoose from 'mongoose';
 import { auth } from '../middleware/auth.js';
 import Sale from '../models/Sale.js';
 import Ingredient from '../models/Ingredient.js';
 import Dish from '../models/Dish.js';
+import { costing } from './dishes.js';
 import { dateRange } from '../utils.js';
 
 const r = Router();
@@ -16,6 +18,27 @@ function dayKey(date) {
   return `${y}-${m}-${day}`;
 }
 
+// Sale.quantity stores the total entered plates (plates sold + returned).
+// Therefore the original Plates Sell value is quantity - returnedQuantity.
+// Returns are shown as return loss, but their cost is NOT subtracted again from profit.
+function saleNumbers(s) {
+  const quantity = Number(s.quantity || 0);
+  const returned = Number(s.returnedQuantity || 0);
+  const price = Number(s.sellingPrice || 0);
+  const unitCost = Number(s._calculatedUnitCost ?? s.unitCost ?? 0);
+  const shareProfit = Number(s._calculatedShareProfit ?? 0);
+  const platesSell = Math.max(0, quantity - returned);
+  const netSold = Math.max(0, platesSell - returned);
+  const sales = netSold * price;
+  const returnLoss = returned * unitCost;
+  const makingCost = platesSell * unitCost;
+  const shareProfitTotal = netSold * shareProfit;
+  const profit = sales - makingCost - shareProfitTotal;
+  const perPlateProfitLoss = price - unitCost - shareProfit;
+
+  return { quantity, returned, price, unitCost, shareProfit, platesSell, netSold, sales, returnLoss, makingCost, shareProfitTotal, profit, perPlateProfitLoss };
+}
+
 function buildDaily(start, end, sales) {
   const map = new Map();
   for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
@@ -26,22 +49,15 @@ function buildDaily(start, end, sales) {
     const key = dayKey(s.date);
     if (!map.has(key)) return;
     const row = map.get(key);
-    const quantity = Number(s.quantity || 0);
-    const returned = Number(s.returnedQuantity || 0);
-    const price = Number(s.sellingPrice || 0);
-    const unitCost = Number(s.unitCost || 0);
-    const grossSales = quantity * price;
-    const returnCost = returned * unitCost;
-    const netSales = grossSales - (returned * price);
-    const makingCost = quantity * unitCost;
+    const v = saleNumbers(s);
 
-    row.platesMade += quantity;
-    row.returned += returned;
-    row.netSold += Math.max(0, quantity - returned);
-    row.sales += netSales;
-    row.returnLoss += returnCost;
-    row.makingCost += makingCost;
-    row.profit += netSales - makingCost;
+    row.platesMade += v.platesSell;
+    row.returned += v.returned;
+    row.netSold += v.netSold;
+    row.sales += v.sales;
+    row.returnLoss += v.returnLoss;
+    row.makingCost += v.makingCost;
+    row.profit += v.profit;
   });
 
   return [...map.values()];
@@ -59,41 +75,68 @@ r.get('/', async (req, res) => {
       Ingredient.countDocuments({ userId: req.user.id, active: true })
     ]);
 
-    const revenue = sales.reduce((sum, x) => {
-      const quantity = Number(x.quantity || 0);
-      const returned = Number(x.returnedQuantity || 0);
-      const price = Number(x.sellingPrice || 0);
-      return sum + (quantity - returned) * price;
-    }, 0);
-    const returnLoss = sales.reduce((sum, x) => sum + Number(x.returnedQuantity || 0) * Number(x.unitCost || 0), 0);
-    const makingCost = sales.reduce((sum, x) => sum + Number(x.quantity || 0) * Number(x.unitCost || 0), 0);
-    const platesMade = sales.reduce((sum, x) => sum + Number(x.quantity || 0), 0);
-    const returned = sales.reduce((sum, x) => sum + Number(x.returnedQuantity || 0), 0);
-    const netSold = sales.reduce((sum, x) => sum + Math.max(0, Number(x.quantity || 0) - Number(x.returnedQuantity || 0)), 0);
-    const profit = revenue - makingCost;
+    // Sales created before the calculation fix may contain the old cost-per-piece
+    // snapshot (e.g. ₹3.43). For reporting, a dish means one plate/serving, so
+    // the correct cost is Dish Cost = costPerPiece × piecesPerDish (e.g. ₹10.29).
+    // Recalculate the dish cost from the current recipe so old saved sales also
+    // follow the same rule as newly saved sales.
+    // A sale can reference a dish that has since been deleted. After populate,
+    // such a dishId is null; never turn null into the literal string "null"
+    // because MongoDB then tries to cast it to ObjectId and the whole report fails.
+    const dishIds = [...new Set(sales
+      .map(s => s.dishId?._id ? String(s.dishId._id) : (s.dishId ? String(s.dishId) : null))
+      .filter(id => id && mongoose.Types.ObjectId.isValid(id)))];
+    const dishDocs = await Dish.find({ userId: req.user.id, _id: { $in: dishIds } });
+    const costMap = new Map();
+    const shareMap = new Map();
+    await Promise.all(dishDocs.map(async d => {
+      const c = await costing(d, req.user.id);
+      costMap.set(String(d._id), c.dishCost);
+      shareMap.set(String(d._id), c.shareProfit);
+    }));
+    sales.forEach(s => {
+      const id = String(s.dishId?._id || s.dishId);
+      if (costMap.has(id)) s._calculatedUnitCost = costMap.get(id);
+      if (shareMap.has(id)) s._calculatedShareProfit = shareMap.get(id);
+    });
+
+    let revenue = 0;
+    let returnLoss = 0;
+    let makingCost = 0;
+    let platesSell = 0;
+    let returned = 0;
+    let netSold = 0;
+    let profit = 0;
 
     const byDishMap = {};
     for (const x of sales) {
+      const v = saleNumbers(x);
+      revenue += v.sales;
+      returnLoss += v.returnLoss;
+      makingCost += v.makingCost;
+      platesSell += v.platesSell;
+      returned += v.returned;
+      netSold += v.netSold;
+      profit += v.profit;
+
       const name = x.dishId?.name || 'Deleted dish';
-      byDishMap[name] ??= { sales: 0, cost: 0, profit: 0, quantity: 0, returned: 0 };
-      const quantity = Number(x.quantity || 0);
-      const returnedQty = Number(x.returnedQuantity || 0);
-      const price = Number(x.sellingPrice || 0);
-      const unitCost = Number(x.unitCost || 0);
-      const netSales = (quantity - returnedQty) * price;
-      const dishMakingCost = quantity * unitCost;
-      const dishReturnCost = returnedQty * unitCost;
-      byDishMap[name].sales += netSales;
-      byDishMap[name].cost += dishMakingCost;
-      byDishMap[name].profit += netSales - dishMakingCost;
-      byDishMap[name].quantity += quantity;
-      byDishMap[name].returned += returnedQty;
+      byDishMap[name] ??= { sales: 0, cost: 0, profit: 0, quantity: 0, returned: 0, netSold: 0, platesSell: 0, perPlateProfitLoss: 0 };
+      byDishMap[name].sales += v.sales;
+      byDishMap[name].cost += v.makingCost;
+      byDishMap[name].profit += v.profit;
+      byDishMap[name].quantity += v.quantity;
+      byDishMap[name].returned += v.returned;
+      byDishMap[name].platesSell += v.platesSell;
+      byDishMap[name].netSold += v.netSold;
+      // This is the same per-dish/per-plate profit shown in Dishes & Recipes:
+      // selling price - cost of the pieces used in one dish.
+      byDishMap[name].perPlateProfitLoss = v.perPlateProfitLoss;
     }
 
     res.json({
       range: { from: a, to: b },
       type,
-      today: { sales: revenue, returnLoss, makingCost, profit, platesMade, returned, netSold },
+      today: { sales: revenue, returnLoss, makingCost, profit, platesMade: platesSell, returned, netSold },
       totals: { dishes, ingredients },
       daily: buildDaily(a, b, sales),
       byDish: Object.entries(byDishMap)
