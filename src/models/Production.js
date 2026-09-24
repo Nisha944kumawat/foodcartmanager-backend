@@ -1,0 +1,4 @@
+import mongoose from 'mongoose';
+const schema=new mongoose.Schema({userId:{type:mongoose.Schema.Types.ObjectId,ref:'User',required:true},dishId:{type:mongoose.Schema.Types.ObjectId,ref:'Dish',required:true},date:{type:Date,required:true},batches:{type:Number,required:true,min:0.0001},quantityProduced:{type:Number,required:true,min:0.0001},yieldUnit:{type:String,required:true},totalCost:{type:Number,required:true,min:0},unitCost:{type:Number,required:true,min:0},ingredientUsage:[{ingredientId:{type:mongoose.Schema.Types.ObjectId,ref:'Ingredient'},name:String,quantity:Number,unit:String,cost:Number,rate:Number,rateUnit:String}],additionalCostSnapshot:[{name:String,amount:Number}],notes:String},{timestamps:true});
+schema.index({userId:1,date:-1});
+export default mongoose.model('Production',schema);
